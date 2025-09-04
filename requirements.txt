@@ -1,0 +1,5 @@
+streamlit>=1.33
+openai>=1.40
+pandas>=2.2
+pillow>=10.3
+pypdf2>=3.0
