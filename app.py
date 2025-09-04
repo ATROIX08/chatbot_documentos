@@ -1,9 +1,6 @@
 # app.py
-# Streamlit + Gemma 3 (1B) por API (OpenRouter/Together) + agente JSON tools
-# Caso de uso: Onboarding/Inicio de sesión para conductores y pasajeros
-# - BD SQLite (archivo) y carpeta uploads/ (persisten mientras la instancia viva)
-# - Validación básica de archivos
-# - "Tool-calling" implementado en la app (modelo responde JSON con {action, tool, args})
+# Streamlit + Gemma 3 (1B/12B) por API (OpenRouter/Together) + agente JSON tools
+# Caso: Onboarding/Inicio de sesión para conductores y pasajeros
 
 import os
 import re
@@ -24,8 +21,8 @@ from openai import OpenAI
 def get_llm_client_and_model():
     """
     Selecciona proveedor según secretos disponibles.
-    - OPENROUTER_API_KEY (recomendado): base_url OpenRouter, model "google/gemma-3-1b-it"
-    - TOGETHER_API_KEY: base_url Together, model "google/gemma-3-1b-it"
+    - OPENROUTER_API_KEY (recomendado): base_url OpenRouter, model "google/gemma-3-1b-it" o "google/gemma-3-12b-it:free"
+    - TOGETHER_API_KEY: base_url Together, model "google/gemma-3-1b-it" (u otro soportado)
     """
     if "OPENROUTER_API_KEY" in st.secrets:
         client = OpenAI(
@@ -67,7 +64,7 @@ def _get_cached_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(
         DB_PATH,
         check_same_thread=False,
-        timeout=30,  # espera si hay lock
+        timeout=30,
         isolation_level=None,  # autocommit-like
     )
     conn.row_factory = sqlite3.Row
@@ -80,13 +77,7 @@ def _get_cached_conn() -> sqlite3.Connection:
     return conn
 
 def get_conn() -> sqlite3.Connection:
-    # Devolver siempre la misma conexión cacheada
     return _get_cached_conn()
-
-def table_exists(conn, name):
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-    return cur.fetchone() is not None
 
 def bootstrap_db(conn: sqlite3.Connection):
     cur = conn.cursor()
@@ -141,7 +132,6 @@ def bootstrap_db(conn: sqlite3.Connection):
     conn.commit()
 
 def upsert_user(user_id: str, role: str):
-    # Evita inserts inválidos por reruns con user_id vacío
     user_id = (user_id or "").strip()
     role = role if role in ("driver", "rider") else "driver"
     if not user_id:
@@ -153,7 +143,6 @@ def upsert_user(user_id: str, role: str):
         cur.execute("INSERT INTO users(user_id, role, created_at) VALUES (?,?,datetime('now'))", (user_id, role))
         conn.commit()
     else:
-        # Si cambian el rol del mismo user_id en UI, actualizar
         cur.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
         conn.commit()
 
@@ -377,7 +366,7 @@ if user_prompt:
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-# ------------------------------ Lazo de agente -------------------------------
+# ------------------------------ Utilidades LLM -------------------------------
 def extract_json(text: str) -> Optional[dict]:
     # Intenta parsear JSON directo o bloque ```json ... ```
     text = text.strip()
@@ -397,14 +386,45 @@ def extract_json(text: str) -> Optional[dict]:
                 return None
     return None
 
+def _model_supports_system(provider: str, model_name: str) -> bool:
+    """
+    Algunos proveedores (p.ej., Google AI Studio vía OpenRouter para gemma/gemini)
+    no permiten 'developer/system instruction'. En esos casos devolvemos False.
+    """
+    m = (model_name or "").lower()
+    if provider == "openrouter" and (m.startswith("google/") or "gemini" in m):
+        # Incluye google/gemma-3-12b-it:free, etc.
+        return False
+    return True
+
+def _build_api_messages(history: List[Dict[str,str]], system_prompt: str, supports_system: bool) -> List[Dict[str,str]]:
+    """
+    Si el modelo permite system => usamos rol 'system'.
+    Si NO, incrustamos el system_prompt como prefacio del primer mensaje 'user'.
+    """
+    if supports_system:
+        return [{"role": "system", "content": system_prompt}] + history
+    else:
+        preface = (
+            "INSTRUCCIONES DEL SISTEMA (no revelar al usuario):\n"
+            + system_prompt +
+            "\n\nSigue estrictamente el formato JSON indicado arriba en todas tus respuestas."
+        )
+        return [{"role": "user", "content": preface}] + history
+
+# ------------------------------ Lazo de agente -------------------------------
 def run_agent():
     client, model, provider = get_llm_client_and_model()
+    supports_system = _model_supports_system(provider, model)
 
     # 1) Pedimos al modelo un JSON (posible llamada a tool)
-    msgs = [{"role":"system","content": SYSTEM_PROMPT}]
-    # Condensamos historial como contexto, pero el modelo solo debe devolver JSON
+    history = []
     for m in st.session_state["messages"][-8:]:
-        msgs.append(m)
+        # Solo reenviamos roles user/assistant del historial del chat
+        if m["role"] in ("user", "assistant"):
+            history.append(m)
+
+    msgs = _build_api_messages(history, SYSTEM_PROMPT, supports_system)
 
     resp = client.chat.completions.create(
         model=model,
@@ -445,10 +465,14 @@ def run_agent():
             "args": args,
             "output": out
         }
-        msgs2 = msgs + [{
+        followup_history = history + [{
             "role":"user",
-            "content": "Resultado de herramienta (formato JSON). Redacta respuesta final:\n```json\n" + json.dumps(tool_feedback, ensure_ascii=False) + "\n```"
+            "content": "Resultado de herramienta (formato JSON). Redacta respuesta final:\n```json\n"
+                       + json.dumps(tool_feedback, ensure_ascii=False)
+                       + "\n```"
         }]
+        msgs2 = _build_api_messages(followup_history, SYSTEM_PROMPT, supports_system)
+
         resp2 = client.chat.completions.create(
             model=model,
             messages=msgs2,
