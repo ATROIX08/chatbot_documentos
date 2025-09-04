@@ -54,16 +54,34 @@ UPLOAD_DIR = Path("uploads")
 DATA_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-DB_PATH = DATA_DIR / "onboarding.db"
+DB_PATH = str(DATA_DIR / "onboarding.db")  # como str para evitar rarezas en algunos entornos
 
 # ------------------------ Base de datos y esquema ----------------------------
-def get_conn():
-    if "db_conn" not in st.session_state:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        st.session_state.db_conn = conn
-        bootstrap_db(conn)
-    return st.session_state.db_conn
+@st.cache_resource(show_spinner=False)
+def _get_cached_conn() -> sqlite3.Connection:
+    """
+    Conexión singleton, segura para reruns de Streamlit.
+    - check_same_thread=False para evitar ProgrammingError por hilos distintos.
+    - PRAGMA para estabilidad/concurrencia básica en demo.
+    """
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=30,  # espera si hay lock
+        isolation_level=None,  # autocommit-like
+    )
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("PRAGMA foreign_keys = ON;")
+    cur.execute("PRAGMA journal_mode = WAL;")
+    cur.execute("PRAGMA synchronous = NORMAL;")
+    conn.commit()
+    bootstrap_db(conn)
+    return conn
+
+def get_conn() -> sqlite3.Connection:
+    # Devolver siempre la misma conexión cacheada
+    return _get_cached_conn()
 
 def table_exists(conn, name):
     cur = conn.cursor()
@@ -123,11 +141,20 @@ def bootstrap_db(conn: sqlite3.Connection):
     conn.commit()
 
 def upsert_user(user_id: str, role: str):
+    # Evita inserts inválidos por reruns con user_id vacío
+    user_id = (user_id or "").strip()
+    role = role if role in ("driver", "rider") else "driver"
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,))
     if cur.fetchone() is None:
         cur.execute("INSERT INTO users(user_id, role, created_at) VALUES (?,?,datetime('now'))", (user_id, role))
+        conn.commit()
+    else:
+        # Si cambian el rol del mismo user_id en UI, actualizar
+        cur.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
         conn.commit()
 
 def fetch_requirements(role: str) -> List[Dict[str, Any]]:
